@@ -1,0 +1,77 @@
+name: SQL CIEDE2000 Testing (PostgreSQL)
+
+on:
+  workflow_dispatch:
+
+env:
+  n_csv_lines: 10000000
+  PGSERVICE: postgres
+
+jobs:
+  test-implementation-de00-psql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📂 For each step below, a new shell will be started at the repository root
+        uses: actions/checkout@v6
+
+      - name: 📦 Set up PostgreSQL
+        uses: ikalnytskyi/action-setup-postgres@v7
+
+      - name: 📦 Set up GCC
+        run: command -v gcc > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes gcc ; }
+
+      - name: ⚙️ Load the CIEDE2000 function into the database
+        run: psql --version && psql -f ciede2000.pg.sql
+
+      - name: 🌐️ Download the CIEDE2000 driver program
+        run: wget --no-verbose --no-check-certificate --timeout=5 --tries=2 https://ciede2000.pages-perso.free.fr/static/github/ciede2000-native-precision-driver.c
+
+      - name: ⚙️ Compile the CIEDE2000 driver program in C99
+        run: gcc --version && gcc -std=c99 -Wall -pedantic -O2 -g ciede2000-native-precision-driver.c -o ciede2000-native -lm
+
+      - name: 🎨 Generate ΔE2000 color difference test cases
+        run: ./ciede2000-native --number $n_csv_lines --with-weights --output-file test-cases.csv
+
+      - name: ⚙️ Load the CSV file into the PostgreSQL database
+        run: |
+          p="double precision"
+          psql -c "CREATE UNLOGGED TABLE colors (l1 $p, a1 $p, b1 $p, l2 $p, a2 $p, b2 $p, kl $p, kc $p, kh $p);"
+          psql -c "\copy colors FROM test-cases.csv WITH (FORMAT csv);"
+          rm test-cases.csv
+
+      - name: 🚀 Run test cases in PostgreSQL and stream to verifier
+        run: |
+          psql -c "\copy (
+            SELECT
+              l1,a1,b1,l2,a2,b2,kl,kc,kh,
+              ciede2000_with_parameters(l1,a1,b1,l2,a2,b2,kl,kc,kh,TRUE) AS delta_e
+            FROM colors
+          ) TO STDOUT WITH CSV;" | ./ciede2000-native -o summary-canonical.txt &
+          psql -c "\copy (
+            SELECT
+              l1,a1,b1,l2,a2,b2,kl,kc,kh,
+              ciede2000_with_parameters(l1,a1,b1,l2,a2,b2,kl,kc,kh,FALSE) AS delta_e
+            FROM colors
+          ) TO STDOUT WITH CSV;" | ./ciede2000-native -o summary-simplified.txt &
+          wait
+
+      - name: 🏁 Conclusion
+        run: |
+          for compliance in simplified canonical; do
+            file="summary-$compliance.txt"
+            cat "$file"
+            #
+            if [ "${file%canonical.txt}" = "$file" ]; then
+              Q1="[ ] CANONICAL [X] SIMPLIFIED"
+            else
+              Q1="[X] CANONICAL [ ] SIMPLIFIED"
+            fi
+            if grep -Fq "$Q1" "$file" && grep -Fq "Error : 0" "$file" && grep -Fq "Successes : $n_csv_lines" "$file"; then
+              echo "✔️ Verification of $file successful: all $n_csv_lines color differences were correctly calculated."
+            else
+              echo "❌ Verification failed. See above for details."
+              exit 1
+            fi
+          done

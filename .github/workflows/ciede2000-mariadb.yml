@@ -1,0 +1,107 @@
+name: SQL CIEDE2000 Testing (MariaDB)
+
+on:
+  workflow_dispatch:
+
+env:
+  n_csv_lines: 10000000
+
+jobs:
+  test-implementation-de00-mariadb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 📂 For each step below, a new shell will be started at the repository root
+        uses: actions/checkout@v6
+
+      - name: 📦 Set up MariaDB
+        uses: ankane/setup-mariadb@v1
+        with:
+          database: testdb
+
+      - name: 📦 Set up GCC
+        run: command -v gcc > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes gcc ; }
+
+      - name: ⚙️ Load the CIEDE2000 function into the database
+        run: mariadb -V && mariadb -D testdb < ciede2000.sql
+
+      - name: 🌐️ Download the CIEDE2000 driver program
+        run: wget --no-verbose --no-check-certificate --timeout=5 --tries=2 https://ciede2000.pages-perso.free.fr/static/github/ciede2000-native-precision-driver.c
+
+      - name: ⚙️ Compile the CIEDE2000 driver program in C99
+        run: gcc --version && gcc -std=c99 -Wall -pedantic -O2 -g ciede2000-native-precision-driver.c -o ciede2000-native -lm
+
+      - name: 🎨 Generate ΔE2000 color difference test cases
+        run: |
+          # Splits the large file into as many smaller files as there are vCPUs
+          n_cpu=$(nproc) && ./ciede2000-native --number $n_csv_lines --with-weights |
+          split --unbuffered --lines=$(( ($n_csv_lines + $n_cpu - 1) / $n_cpu )) --numeric-suffixes=1 --additional-suffix=.csv - test-cases-
+          # Shows the name, size and first line of newly created files
+          du -h test-cases-* | awk '{getline line < $2; print $2, "(" $1 "B) contains L*a*b* color pairs for vCPU " NR ", first values =", line}'
+
+      - name: ⚙️ Load CSV file into database
+        run: |
+          mariadb -D testdb -e "SET GLOBAL local_infile=1"
+          for file in test-cases-*; do
+            i=$(echo $file | sed -r 's/[^0-9]+//g')
+            mariadb -D testdb -e "CREATE TABLE colors_$i (
+                l1 Double,
+                a1 Double,
+                b1 Double,
+                l2 Double,
+                a2 Double,
+                b2 Double,
+                kl Double,
+                kc Double,
+                kh Double
+              ) ENGINE=MyISAM"
+            mariadb --local-infile=1 -D testdb -e "
+              LOAD DATA LOCAL INFILE '$file' INTO TABLE colors_$i
+              FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n'
+              (l1,a1,b1,l2,a2,b2,kl,kc,kh)" &
+              echo "Loads the $(wc -l < $file)-line file $file in table colors_$i"
+          done
+          wait
+          for file in test-cases-*; do truncate -s 0 "$file"; done
+
+      - name: ⚡ Solves test cases by calculating ΔE2000 in MariaDB (parallelized operation)
+        run: |
+          for canonical in TRUE FALSE; do
+            [ "$canonical" = "TRUE" ] && suffix=canonical || suffix=simplified
+            start_time=$(date +%s)
+            for file in test-cases-*; do
+              i=$(echo $file | sed -r 's/[^0-9]+//g')
+              mariadb -D testdb -B -N -q -e "
+              SELECT CONCAT_WS(',', l1,a1,b1,l2,a2,b2,kl,kc,kh, ciede2000_with_parameters(l1,a1,b1,l2,a2,b2,kl,kc,kh,$canonical)) FROM colors_$i
+              " > solved-"$suffix-$file" &
+              echo "Starts parallel processing on table colors_$i and places the results in solved-$suffix-$file"
+            done
+            wait
+            echo "Took $(( $(date +%s) - start_time )) seconds."
+          done
+
+      - name: 🚀 Check that C99 calculations matches MariaDB’s
+        run: |
+          cat solved-canonical-* | ./ciede2000-native -o summary-canonical.txt &
+          cat solved-simplified-* | ./ciede2000-native -o summary-simplified.txt &
+          wait
+
+      - name: 🏁 Conclusion
+        run: |
+          for compliance in simplified canonical; do
+            file="summary-$compliance.txt"
+            cat "$file"
+            #
+            if [ "${file%canonical.txt}" = "$file" ]; then
+              Q1="[ ] CANONICAL [X] SIMPLIFIED"
+            else
+              Q1="[X] CANONICAL [ ] SIMPLIFIED"
+            fi
+            if grep -Fq "$Q1" "$file" && grep -Fq "Error : 0" "$file" && grep -Fq "Successes : $n_csv_lines" "$file"; then
+              echo "✔️ Verification of $file successful: all $n_csv_lines color differences were correctly calculated."
+            else
+              echo "❌ Verification failed. See above for details."
+              exit 1
+            fi
+          done
